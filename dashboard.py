@@ -6,11 +6,110 @@ import re
 
 st.set_page_config(page_title="داشبورد هوشمند مالی", layout="wide", page_icon="📊")
 
-st.markdown("""
+# ---------- Design system ----------
+PAPER = "#EFF3F1"
+CARD = "#FFFFFF"
+INK = "#16262A"
+INK_SOFT = "#4B5D61"
+TEAL = "#1E7F79"
+TEAL_DARK = "#14514E"
+GOLD = "#C89B3C"
+BRICK = "#B4483E"
+INDIGO = "#2B3A55"
+BORDER = "#DCE3E1"
+
+st.markdown(f"""
 <style>
-    * { direction: rtl; text-align: right; }
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&family=Lalezar&display=swap');
+
+* {{ direction: rtl; text-align: right; font-family: 'Vazirmatn', sans-serif; }}
+
+.stApp {{ background: {PAPER}; }}
+[data-testid="stSidebar"] {{ background: {INDIGO}; }}
+[data-testid="stSidebar"] * {{ color: #EAEFEE !important; }}
+[data-testid="stSidebar"] .stButton>button {{
+    width: 100%; text-align: right; background: transparent;
+    border: 1px solid rgba(255,255,255,0.14); border-radius: 10px;
+    padding: 0.6rem 0.9rem; margin-bottom: 6px; font-weight: 500;
+    transition: background 0.15s ease;
+}}
+[data-testid="stSidebar"] .stButton>button:hover {{ background: rgba(255,255,255,0.08); }}
+[data-testid="stSidebar"] .stButton>button[kind="primary"] {{
+    background: {TEAL}; border-color: {TEAL};
+}}
+
+.hero-title {{
+    font-family: 'Lalezar', sans-serif; font-size: 34px; color: {INK};
+    margin: 0; letter-spacing: 0.5px;
+}}
+.hero-sub {{ color: {INK_SOFT}; font-size: 14px; margin: 4px 0 0; }}
+
+.tile-divider {{
+    height: 6px; border-radius: 3px; margin: 14px 0 26px;
+    background: repeating-linear-gradient(-45deg, {TEAL} 0 10px, {GOLD} 10px 20px);
+    opacity: 0.85;
+}}
+
+.metric-card {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 12px;
+    padding: 1.1rem 1.3rem; border-right: 4px solid var(--accent, {TEAL});
+    animation: riseIn 0.35s ease both;
+}}
+.metric-label {{ font-size: 13px; color: {INK_SOFT}; margin: 0 0 6px; display: flex; gap: 6px; align-items: center; }}
+.metric-value {{
+    font-size: 26px; font-weight: 700; color: {INK}; margin: 0;
+    font-variant-numeric: tabular-nums;
+}}
+@keyframes riseIn {{
+    from {{ opacity: 0; transform: translateY(6px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+}}
+@media (prefers-reduced-motion: reduce) {{ .metric-card {{ animation: none; }} }}
+
+.section-label {{
+    font-size: 13px; color: {INK_SOFT}; font-weight: 600; margin: 22px 0 10px;
+    display: flex; align-items: center; gap: 8px;
+}}
+.section-label::after {{ content: ""; flex: 1; height: 1px; background: {BORDER}; }}
+
+.stButton>button {{
+    border-radius: 10px; font-weight: 500; border: 1px solid {BORDER};
+}}
+.stButton>button[kind="primary"] {{
+    background: {TEAL}; border-color: {TEAL}; color: white;
+}}
+.stButton>button[kind="primary"]:hover {{ background: {TEAL_DARK}; border-color: {TEAL_DARK}; }}
+
+[data-testid="stChatMessage"] {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 14px;
+    padding: 4px 6px; margin-bottom: 10px;
+}}
+
+[data-testid="stFileUploaderDropzone"] {{
+    background: {CARD}; border: 1.5px dashed {TEAL}; border-radius: 12px;
+}}
+
+.stTextInput>div>div>input, .stChatInput textarea {{
+    border-radius: 10px !important;
+}}
+
+hr {{ border-color: {BORDER}; }}
 </style>
 """, unsafe_allow_html=True)
+
+
+def metric_card(label, value, icon, accent):
+    st.markdown(f"""
+    <div class="metric-card" style="--accent: {accent};">
+        <p class="metric-label">{icon} {label}</p>
+        <p class="metric-value">{value:,.0f}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def section_label(text):
+    st.markdown(f'<div class="section-label">{text}</div>', unsafe_allow_html=True)
+
 
 # ---------- Session state defaults ----------
 defaults = {
@@ -35,8 +134,6 @@ def get_model():
 
 
 def extract_json(text: str) -> dict:
-    """Pull the first {...} block out of a model response, tolerant of
-    markdown fences or extra commentary around the JSON."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         raise ValueError("پاسخ هوش مصنوعی شامل JSON معتبر نبود.")
@@ -50,29 +147,45 @@ def go_to(tab_name, **flags):
     st.rerun()
 
 
-# ---------- Top navigation ----------
-st.title("📊 داشبورد هوشمند مالی با هوش مصنوعی")
+# ---------- Sidebar navigation ----------
+with st.sidebar:
+    st.markdown(f"<p style='font-family:Lalezar; font-size:22px; margin-bottom:2px;'>📊 مالی هوشمند</p>", unsafe_allow_html=True)
+    st.markdown("<p style='font-size:12px; opacity:0.7; margin-top:0;'>دستیار مالی مبتنی بر هوش مصنوعی</p>", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
 
-tabs = ["داشبورد", "بارگذاری داده", "دستیار هوش مصنوعی", "تنظیمات"]
-cols = st.columns(len(tabs))
-for i, name in enumerate(tabs):
-    btn_type = "primary" if st.session_state.active_tab == name else "secondary"
-    if cols[i].button(name, use_container_width=True, type=btn_type, key=f"nav_{name}"):
-        st.session_state.active_tab = name
-        st.rerun()
+    nav_items = [
+        ("داشبورد", "📊"),
+        ("بارگذاری داده", "📁"),
+        ("دستیار هوش مصنوعی", "🧠"),
+        ("تنظیمات", "⚙️"),
+    ]
+    for name, icon in nav_items:
+        btn_type = "primary" if st.session_state.active_tab == name else "secondary"
+        if st.button(f"{icon}  {name}", use_container_width=True, type=btn_type, key=f"nav_{name}"):
+            st.session_state.active_tab = name
+            st.rerun()
 
-st.divider()
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    status = "متصل" if st.session_state.api_key else "بدون کلید"
+    dot = TEAL if st.session_state.api_key else BRICK
+    st.markdown(f"<p style='font-size:12px;'><span style='color:{dot};'>●</span> وضعیت API: {status}</p>", unsafe_allow_html=True)
+
+
+# ---------- Header ----------
+st.markdown('<p class="hero-title">داشبورد هوشمند مالی</p>', unsafe_allow_html=True)
+st.markdown('<p class="hero-sub">تحلیل داده مالی و مشاوره مدیریتی با هوش مصنوعی</p>', unsafe_allow_html=True)
+st.markdown('<div class="tile-divider"></div>', unsafe_allow_html=True)
 
 # ---------- TAB: settings ----------
 if st.session_state.active_tab == "تنظیمات":
-    st.subheader("⚙️ تنظیمات کلید API")
-    st.write("کلید Gemini API خود را وارد کنید. این کلید فقط در حافظه این نشست (session) ذخیره می‌شود و در دیسک یا گیت‌هاب ذخیره نمی‌شود.")
+    section_label("⚙️ کلید API")
+    st.write("کلید Gemini API خود را وارد کنید. این کلید فقط در حافظه این نشست ذخیره می‌شود و در دیسک یا گیت‌هاب ذخیره نمی‌شود.")
     key_input = st.text_input("Gemini API Key", value=st.session_state.api_key, type="password")
     c1, c2 = st.columns(2)
-    if c1.button("ذخیره کلید", type="primary"):
+    if c1.button("ذخیره کلید", type="primary", use_container_width=True):
         st.session_state.api_key = key_input
         st.success("کلید ذخیره شد.")
-    if c2.button("تست اتصال"):
+    if c2.button("تست اتصال", use_container_width=True):
         model = get_model()
         if not model:
             st.error("ابتدا کلید را وارد کنید.")
@@ -85,7 +198,7 @@ if st.session_state.active_tab == "تنظیمات":
 
 # ---------- TAB: data upload ----------
 elif st.session_state.active_tab == "بارگذاری داده":
-    st.subheader("📁 بارگذاری داده مالی")
+    section_label("📁 بارگذاری داده مالی")
     if not st.session_state.api_key:
         st.warning("برای پردازش هوشمند ستون‌ها، ابتدا کلید API را در تب تنظیمات وارد کنید.")
 
@@ -103,7 +216,8 @@ elif st.session_state.active_tab == "بارگذاری داده":
 
         if raw_data is not None:
             st.session_state.raw_data = raw_data
-            st.write("داده‌های خام:", raw_data.head(5))
+            section_label("پیش‌نمایش داده خام")
+            st.dataframe(raw_data.head(5), use_container_width=True)
 
             if st.button("پردازش داده با هوش مصنوعی", type="primary"):
                 model = get_model()
@@ -155,24 +269,29 @@ elif st.session_state.active_tab == "داشبورد":
         total_expense = clean_data["expense"].sum()
         total_profit = clean_data["profit"].sum()
 
+        section_label("خلاصه وضعیت مالی")
         col1, col2, col3 = st.columns(3)
-        col1.metric("کل درآمد", f"{total_income:,.0f}")
-        col2.metric("کل هزینه‌ها", f"{total_expense:,.0f}")
-        col3.metric("سود خالص", f"{total_profit:,.0f}")
+        with col1:
+            metric_card("کل درآمد", total_income, "💰", TEAL)
+        with col2:
+            metric_card("کل هزینه‌ها", total_expense, "🧾", BRICK)
+        with col3:
+            metric_card("سود خالص", total_profit, "📈", GOLD)
 
+        section_label("روند درآمد و هزینه")
         if "date" in clean_data.columns:
             chart_data = clean_data.set_index("date")[["income", "expense"]]
         else:
             chart_data = clean_data[["income", "expense"]]
-        st.bar_chart(chart_data)
+        st.bar_chart(chart_data, color=[TEAL, BRICK])
 
-        st.divider()
+        st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🧠 تحلیل با هوش مصنوعی", type="primary"):
             go_to("دستیار هوش مصنوعی", pending_auto_analysis=True)
 
 # ---------- TAB: AI assistant (chat) ----------
 elif st.session_state.active_tab == "دستیار هوش مصنوعی":
-    st.subheader("🧠 دستیار هوش مصنوعی")
+    section_label("🧠 دستیار هوش مصنوعی")
 
     model = get_model()
     if not model:
@@ -203,13 +322,14 @@ elif st.session_state.active_tab == "دستیار هوش مصنوعی":
                     st.error(f"خطا در تولید تحلیل: {e}")
 
         for msg in st.session_state.chat_history:
-            with st.chat_message(msg["role"]):
+            avatar = "🧑" if msg["role"] == "user" else "🧠"
+            with st.chat_message(msg["role"], avatar=avatar):
                 st.write(msg["content"])
 
         user_msg = st.chat_input("سوال خود را درباره وضعیت مالی بپرسید...")
         if user_msg:
             st.session_state.chat_history.append({"role": "user", "content": user_msg})
-            with st.chat_message("user"):
+            with st.chat_message("user", avatar="🧑"):
                 st.write(user_msg)
 
             context_note = ""
@@ -226,7 +346,7 @@ elif st.session_state.active_tab == "دستیار هوش مصنوعی":
                 for m in st.session_state.chat_history[:-1]
             ]
 
-            with st.chat_message("assistant"):
+            with st.chat_message("assistant", avatar="🧠"):
                 with st.spinner("در حال فکر کردن..."):
                     try:
                         chat = model.start_chat(history=history_for_api)
