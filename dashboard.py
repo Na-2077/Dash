@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import google.generativeai as genai
 import json
@@ -31,9 +32,11 @@ st.markdown(f"""
     width: 100%; text-align: right; background: transparent;
     border: 1px solid rgba(255,255,255,0.14); border-radius: 10px;
     padding: 0.6rem 0.9rem; margin-bottom: 6px; font-weight: 500;
-    transition: background 0.15s ease;
+    transition: background 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
 }}
-[data-testid="stSidebar"] .stButton>button:hover {{ background: rgba(255,255,255,0.08); }}
+[data-testid="stSidebar"] .stButton>button:hover {{
+    background: rgba(255,255,255,0.1); transform: translateX(-3px);
+}}
 [data-testid="stSidebar"] .stButton>button[kind="primary"] {{
     background: {TEAL}; border-color: {TEAL};
 }}
@@ -41,40 +44,57 @@ st.markdown(f"""
 .hero-title {{
     font-family: 'Lalezar', sans-serif; font-size: 34px; color: {INK};
     margin: 0; letter-spacing: 0.5px;
+    animation: fadeSlide 0.5s ease both;
 }}
-.hero-sub {{ color: {INK_SOFT}; font-size: 14px; margin: 4px 0 0; }}
+.hero-sub {{ color: {INK_SOFT}; font-size: 14px; margin: 4px 0 0; animation: fadeSlide 0.5s ease 0.08s both; }}
 
 .tile-divider {{
     height: 6px; border-radius: 3px; margin: 14px 0 26px;
     background: repeating-linear-gradient(-45deg, {TEAL} 0 10px, {GOLD} 10px 20px);
-    opacity: 0.85;
+    opacity: 0.85; transform-origin: right center;
+    animation: growIn 0.7s cubic-bezier(.2,.9,.25,1) 0.15s both;
 }}
 
 .metric-card {{
     background: {CARD}; border: 1px solid {BORDER}; border-radius: 12px;
     padding: 1.1rem 1.3rem; border-right: 4px solid var(--accent, {TEAL});
-    animation: riseIn 0.35s ease both;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
 }}
+.metric-card:hover {{ transform: translateY(-3px); box-shadow: 0 8px 18px rgba(20,30,30,0.08); }}
 .metric-label {{ font-size: 13px; color: {INK_SOFT}; margin: 0 0 6px; display: flex; gap: 6px; align-items: center; }}
 .metric-value {{
     font-size: 26px; font-weight: 700; color: {INK}; margin: 0;
     font-variant-numeric: tabular-nums;
 }}
-@keyframes riseIn {{
-    from {{ opacity: 0; transform: translateY(6px); }}
+
+@keyframes fadeSlide {{
+    from {{ opacity: 0; transform: translateY(8px); }}
     to {{ opacity: 1; transform: translateY(0); }}
 }}
-@media (prefers-reduced-motion: reduce) {{ .metric-card {{ animation: none; }} }}
+@keyframes growIn {{
+    from {{ transform: scaleX(0); }}
+    to {{ transform: scaleX(1); }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    .hero-title, .hero-sub, .tile-divider, [data-testid="stChatMessage"] {{ animation: none !important; }}
+    .metric-card:hover {{ transform: none; }}
+}}
 
 .section-label {{
     font-size: 13px; color: {INK_SOFT}; font-weight: 600; margin: 22px 0 10px;
     display: flex; align-items: center; gap: 8px;
 }}
-.section-label::after {{ content: ""; flex: 1; height: 1px; background: {BORDER}; }}
+.section-label::after {{
+    content: ""; flex: 1; height: 1px; background: {BORDER};
+    transform-origin: right center; animation: growIn 0.5s ease both;
+}}
 
 .stButton>button {{
     border-radius: 10px; font-weight: 500; border: 1px solid {BORDER};
+    transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
 }}
+.stButton>button:hover {{ transform: translateY(-2px); box-shadow: 0 6px 14px rgba(20,30,30,0.1); }}
+.stButton>button:active {{ transform: translateY(0px) scale(0.98); }}
 .stButton>button[kind="primary"] {{
     background: {TEAL}; border-color: {TEAL}; color: white;
 }}
@@ -83,14 +103,17 @@ st.markdown(f"""
 [data-testid="stChatMessage"] {{
     background: {CARD}; border: 1px solid {BORDER}; border-radius: 14px;
     padding: 4px 6px; margin-bottom: 10px;
+    animation: fadeSlide 0.35s ease both;
 }}
 
 [data-testid="stFileUploaderDropzone"] {{
     background: {CARD}; border: 1.5px dashed {TEAL}; border-radius: 12px;
+    transition: border-color 0.2s ease, background 0.2s ease;
 }}
+[data-testid="stFileUploaderDropzone"]:hover {{ border-color: {TEAL_DARK}; background: #F7FAF9; }}
 
 .stTextInput>div>div>input, .stChatInput textarea {{
-    border-radius: 10px !important;
+    border-radius: 10px !important; transition: box-shadow 0.15s ease;
 }}
 
 hr {{ border-color: {BORDER}; }}
@@ -98,13 +121,47 @@ hr {{ border-color: {BORDER}; }}
 """, unsafe_allow_html=True)
 
 
-def metric_card(label, value, icon, accent):
-    st.markdown(f"""
-    <div class="metric-card" style="--accent: {accent};">
-        <p class="metric-label">{icon} {label}</p>
-        <p class="metric-value">{value:,.0f}</p>
+def metric_card(label, value, icon, accent, index=0):
+    """Metric card with an animated count-up number (runs in its own component iframe)."""
+    delay = index * 90
+    html = f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@600;700&display=swap');
+    html, body {{ margin:0; background: transparent; font-family:'Vazirmatn',sans-serif; direction: rtl; }}
+    .card {{
+        background:{CARD}; border:1px solid {BORDER}; border-radius:12px;
+        padding:1.1rem 1.3rem; border-right:4px solid {accent}; box-sizing:border-box;
+        opacity:0; animation: rise 0.4s ease {delay}ms both;
+    }}
+    .label {{ font-size:13px; color:{INK_SOFT}; margin:0 0 6px; display:flex; gap:6px; align-items:center; }}
+    .value {{ font-size:26px; font-weight:700; color:{INK}; margin:0; font-variant-numeric: tabular-nums; }}
+    @keyframes rise {{ from {{ opacity:0; transform: translateY(8px);}} to {{ opacity:1; transform: translateY(0);}} }}
+    </style>
+    <div class="card">
+      <p class="label">{icon} {label}</p>
+      <p class="value" id="v">۰</p>
     </div>
-    """, unsafe_allow_html=True)
+    <script>
+    (function() {{
+      const el = document.getElementById('v');
+      const target = {value};
+      const duration = 900;
+      const startDelay = {delay};
+      setTimeout(() => {{
+        const start = performance.now();
+        function tick(now) {{
+          const p = Math.min((now - start) / duration, 1);
+          const eased = 1 - Math.pow(1 - p, 3);
+          const current = Math.round(target * eased);
+          el.textContent = current.toLocaleString('en-US');
+          if (p < 1) requestAnimationFrame(tick);
+        }}
+        requestAnimationFrame(tick);
+      }}, startDelay);
+    }})();
+    </script>
+    """
+    components.html(html, height=100)
 
 
 def section_label(text):
@@ -272,11 +329,11 @@ elif st.session_state.active_tab == "داشبورد":
         section_label("خلاصه وضعیت مالی")
         col1, col2, col3 = st.columns(3)
         with col1:
-            metric_card("کل درآمد", total_income, "💰", TEAL)
+            metric_card("کل درآمد", total_income, "💰", TEAL, index=0)
         with col2:
-            metric_card("کل هزینه‌ها", total_expense, "🧾", BRICK)
+            metric_card("کل هزینه‌ها", total_expense, "🧾", BRICK, index=1)
         with col3:
-            metric_card("سود خالص", total_profit, "📈", GOLD)
+            metric_card("سود خالص", total_profit, "📈", GOLD, index=2)
 
         section_label("روند درآمد و هزینه")
         if "date" in clean_data.columns:
