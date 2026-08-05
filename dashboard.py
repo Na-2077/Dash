@@ -255,13 +255,18 @@ def detect_structure(model, raw_data: pd.DataFrame) -> dict:
     return ONLY a JSON object matching exactly one shape below (no markdown, no commentary):
 
     1) Separate income and expense columns:
-    {{"structure": "separate_columns", "date_column": "<col name or null>", "income_column": "<col name>", "expense_column": "<col name>"}}
+    {{"structure": "separate_columns", "date_column": "<col name or null>", "income_column": "<col name>", "expense_column": "<col name>", "category_column": "<col name or null>"}}
 
     2) A single signed amount column (positive means income, negative means expense, or vice versa):
-    {{"structure": "single_amount", "date_column": "<col name or null>", "amount_column": "<col name>", "sign_convention": "positive_is_income" or "negative_is_income"}}
+    {{"structure": "single_amount", "date_column": "<col name or null>", "amount_column": "<col name>", "sign_convention": "positive_is_income" or "negative_is_income", "category_column": "<col name or null>"}}
 
     3) A single amount column plus a text category/type column that says whether each row is income or expense:
-    {{"structure": "amount_with_type", "date_column": "<col name or null>", "amount_column": "<col name>", "type_column": "<col name>", "income_values": ["value1", "value2"], "expense_values": ["value1", "value2"]}}
+    {{"structure": "amount_with_type", "date_column": "<col name or null>", "amount_column": "<col name>", "type_column": "<col name>", "income_values": ["value1", "value2"], "expense_values": ["value1", "value2"], "category_column": "<col name or null>"}}
+
+    In every shape, "category_column" is optional: if there is any column describing WHAT each
+    transaction is for (e.g. "شرح", "دسته‌بندی", "توضیحات", "شرح تراکنش", item/description/category
+    name — NOT the same thing as the income/expense classification itself), name it there so the
+    individual items can be broken down later. If no such column exists, use null.
 
     Pick whichever shape genuinely matches the sample data. Return ONLY the JSON object.
     """
@@ -307,6 +312,16 @@ def build_clean_data(raw_data: pd.DataFrame, structure: dict) -> pd.DataFrame:
         raise ValueError("ساختار شناسایی‌شده پشتیبانی نمی‌شود.")
 
     df["profit"] = df["income"] - df["expense"]
+
+    category_col = structure.get("category_column")
+    if category_col and category_col in df.columns:
+        df["category"] = df[category_col].astype(str).str.strip()
+    elif kind == "amount_with_type":
+        # No separate category column, but the type column itself often carries
+        # the itemized label (e.g. "حقوق", "اجاره"), so fall back to it.
+        df["category"] = df[structure["type_column"]].astype(str).str.strip()
+    else:
+        df["category"] = None
 
     if date_col and date_col in df.columns:
         df = df.rename(columns={date_col: "date"})
@@ -439,6 +454,23 @@ elif st.session_state.active_tab == "داشبورد":
             chart_data = clean_data[["income", "expense"]]
         chart_data = chart_data.rename(columns={"income": "درآمد", "expense": "هزینه"})
         st.bar_chart(chart_data, color=[TEAL, BRICK])
+
+        has_categories = (
+            "category" in clean_data.columns
+            and clean_data["category"].notna().any()
+            and clean_data["category"].nunique() > 1
+        )
+        if has_categories:
+            section_label("جزئیات آیتم‌ها")
+            breakdown = (
+                clean_data.groupby("category")[["income", "expense"]]
+                .sum()
+                .assign(تعداد=clean_data.groupby("category").size())
+                .rename(columns={"income": "درآمد", "expense": "هزینه"})
+                .sort_values("درآمد", ascending=False)
+            )
+            st.dataframe(breakdown, use_container_width=True)
+            st.bar_chart(breakdown[["درآمد", "هزینه"]], color=[TEAL, BRICK])
 
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🧠 تحلیل با هوش مصنوعی", type="primary"):
