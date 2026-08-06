@@ -4,6 +4,8 @@ import pandas as pd
 import json
 import re
 import google.generativeai as genai
+import plotly.express as px
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="داشبورد هوشمند مالی", layout="wide", page_icon="📊")
 
@@ -117,6 +119,27 @@ st.markdown(f"""
 }}
 
 hr {{ border-color: {BORDER}; }}
+
+/* --- استایل‌های جدید برای گزارش هوش مصنوعی --- */
+.ai-report-card {{
+    background: #F7FAF9;
+    border: 1px solid #DCE3E1;
+    border-right: 5px solid #1E7F79;
+    border-radius: 12px;
+    padding: 25px;
+    margin-top: 15px;
+    line-height: 1.9;
+    font-size: 15px;
+    color: #16262A;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.03);
+}}
+.ai-report-card h1, .ai-report-card h2, .ai-report-card h3 {{
+    color: #14514E !important;
+    margin-top: 0;
+    font-family: 'Lalezar', sans-serif;
+}}
+.ai-report-card ul {{ padding-right: 20px; }}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -180,8 +203,6 @@ def to_western_digits(s: str) -> str:
 
 
 def clean_number(val) -> float:
-    """Parses messy real-world numbers: Persian/Arabic digits, currency symbols,
-    thousands separators (، ٬ , space), and parentheses meaning negative."""
     if pd.isna(val):
         return 0.0
     s = str(val).strip()
@@ -223,7 +244,7 @@ def get_model():
     if not st.session_state.api_key:
         return None
     genai.configure(api_key=st.session_state.api_key)
-    return genai.GenerativeModel("gemini-3.5-flash-lite")
+    return genai.GenerativeModel("gemini-3.5-flash-lite") # بروزرسانی نام مدل به نسخه معتبر و سریع
 
 
 def extract_json(text: str) -> dict:
@@ -241,8 +262,6 @@ def go_to(tab_name, **flags):
 
 
 def detect_structure(model, raw_data: pd.DataFrame) -> dict:
-    """Ask the AI to inspect headers AND a few sample rows, then classify the
-    file into one of three common financial-spreadsheet shapes."""
     columns = list(raw_data.columns)
     sample_rows = raw_data.head(4).astype(str).to_dict(orient="records")
     prompt = f"""
@@ -275,8 +294,6 @@ def detect_structure(model, raw_data: pd.DataFrame) -> dict:
 
 
 def build_clean_data(raw_data: pd.DataFrame, structure: dict) -> pd.DataFrame:
-    """Turns raw_data into a dataframe with income/expense/profit columns,
-    based on whichever structure the AI detected."""
     df = raw_data.copy()
     kind = structure.get("structure")
     date_col = structure.get("date_column")
@@ -317,8 +334,6 @@ def build_clean_data(raw_data: pd.DataFrame, structure: dict) -> pd.DataFrame:
     if category_col and category_col in df.columns:
         df["category"] = df[category_col].astype(str).str.strip()
     elif kind == "amount_with_type":
-        # No separate category column, but the type column itself often carries
-        # the itemized label (e.g. "حقوق", "اجاره"), so fall back to it.
         df["category"] = df[structure["type_column"]].astype(str).str.strip()
     else:
         df["category"] = None
@@ -430,7 +445,7 @@ elif st.session_state.active_tab == "بارگذاری داده":
 elif st.session_state.active_tab == "داشبورد":
     clean_data = st.session_state.clean_data
     if clean_data is None:
-        st.info("هنوز داده‌ای پردازش نشده است.")
+        st.info("هنوز داده‌ای پردازش نشده است. لطفاً فایل خود را در بخش 'بارگذاری داده' آپلود و پردازش کنید.")
         if st.button("رفتن به بارگذاری داده", type="primary"):
             go_to("بارگذاری داده")
     else:
@@ -447,67 +462,105 @@ elif st.session_state.active_tab == "داشبورد":
         with col3:
             metric_card("سود خالص", total_profit, "📈", GOLD, index=2)
 
-        section_label("روند درآمد و هزینه")
-        if "date" in clean_data.columns:
-            chart_data = clean_data.set_index("date")[["income", "expense"]]
-        else:
-            chart_data = clean_data[["income", "expense"]]
-        chart_data = chart_data.rename(columns={"income": "درآمد", "expense": "هزینه"})
-        st.bar_chart(chart_data, color=[TEAL, BRICK])
-
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # --- نمودارهای حرفه‌ای با Plotly ---
+        section_label("📊 تحلیل بصری داده‌ها")
+        
+        has_date = "date" in clean_data.columns
         has_categories = (
             "category" in clean_data.columns
             and clean_data["category"].notna().any()
             and clean_data["category"].nunique() > 1
         )
+
+        # 1. نمودار روند زمانی (مساحتی)
+        if has_date:
+            time_data = clean_data.groupby("date")[["income", "expense"]].sum().reset_index()
+            fig_time = px.area(time_data, x="date", y=["income", "expense"],
+                               labels={"value": "مبلغ", "date": "تاریخ", "variable": "نوع تراکنش"},
+                               color_discrete_map={"income": TEAL, "expense": BRICK},
+                               title="روند درآمد و هزینه در گذر زمان")
+            fig_time.update_layout(font_family="Vazirmatn", title_x=0.5, legend_title_text="", hovermode="x unified")
+            newnames = {'income':'درآمد', 'expense': 'هزینه'}
+            fig_time.for_each_trace(lambda t: t.update(name = newnames.get(t.name, t.name),
+                                                       legendgroup = newnames.get(t.name, t.name),
+                                                       hovertemplate = t.hovertemplate.replace(t.name, newnames.get(t.name, t.name))))
+            st.plotly_chart(fig_time, use_container_width=True)
+
+        # 2. نمودارهای دسته‌بندی (دونات و میله‌ای گروهی)
         if has_categories:
-            section_label("جزئیات آیتم‌ها")
-            breakdown = (
-                clean_data.groupby("category")[["income", "expense"]]
-                .sum()
-                .assign(تعداد=clean_data.groupby("category").size())
-                .rename(columns={"income": "درآمد", "expense": "هزینه"})
-                .sort_values("درآمد", ascending=False)
-            )
-            st.dataframe(breakdown, use_container_width=True)
-            st.bar_chart(breakdown[["درآمد", "هزینه"]], color=[TEAL, BRICK])
+            breakdown = clean_data.groupby("category")[["income", "expense"]].sum()
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                # نمودار دونات برای ترکیب هزینه‌ها
+                exp_data = breakdown[breakdown["expense"] > 0].reset_index()
+                if not exp_data.empty:
+                    fig_pie = px.pie(exp_data, values="expense", names="category", hole=0.4,
+                                     title="ترکیب هزینه‌ها", color_discrete_sequence=px.colors.qualitative.Prism)
+                    fig_pie.update_layout(font_family="Vazirmatn", title_x=0.5)
+                    fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.info("هزینه‌ای برای نمایش ترکیب وجود ندارد.")
+                    
+            with c2:
+                # نمودار میله‌ای مقایسه‌ای
+                breakdown_reset = breakdown.reset_index().sort_values("income", ascending=False)
+                fig_bar = go.Figure(data=[
+                    go.Bar(name='درآمد', x=breakdown_reset['category'], y=breakdown_reset['income'], marker_color=TEAL),
+                    go.Bar(name='هزینه', x=breakdown_reset['category'], y=breakdown_reset['expense'], marker_color=BRICK)
+                ])
+                fig_bar.update_layout(barmode='group', title="مقایسه درآمد و هزینه به تفکیک دسته‌بندی",
+                                      font_family="Vazirmatn", title_x=0.5, margin=dict(t=50))
+                st.plotly_chart(fig_bar, use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🧠 تحلیل با هوش مصنوعی", type="primary"):
-            go_to("دستیار هوش مصنوعی", pending_auto_analysis=True)
+        
+        # --- بخش تحلیل تمیز و اختصاصی هوش مصنوعی در همان داشبورد ---
+        section_label("✨ گزارش مدیریتی هوشمند")
+        st.write("با کلیک روی دکمه زیر، هوش مصنوعی داده‌های شما را بررسی کرده و یک گزارش مدیریتی تمیز و طبقه‌بندی شده ارائه می‌دهد.")
+        
+        if st.button("تولید گزارش هوشمند وضعیت مالی", type="primary"):
+            model = get_model()
+            if not model:
+                st.error("ابتدا کلید API را در تب تنظیمات وارد کنید.")
+            else:
+                with st.spinner("در حال استخراج الگوها و نگارش گزارش مدیریتی..."):
+                    prompt = f"""
+                    شما یک مشاور مالی ارشد و تحلیلگر داده هستید. وضعیت مالی زیر را بررسی کنید:
+                    - مجموع درآمد: {total_income:,.0f}
+                    - مجموع هزینه‌ها: {total_expense:,.0f}
+                    - سود خالص: {total_profit:,.0f}
+                    
+                    اگر دسته‌بندی‌هایی وجود دارد: (پرتکرارترین‌ها یا بیشترین مبالغ را مرور کن).
+                    
+                    لطفاً یک گزارش فوق‌العاده تمیز، ساختاریافته و با لحن حرفه‌ای در زبان فارسی بنویس.
+                    حتماً از فرمت Markdown استفاده کن. 
+                    بخش‌های الزامی گزارش:
+                    ۱. **وضعیت کلی**: یک پاراگراف خلاصه از سلامت مالی.
+                    ۲. **نقاط قوت**: بولت‌پوینت‌های کوتاه.
+                    ۳. **نقاط ضعف یا هشدارها**: بولت‌پوینت‌های کوتاه.
+                    ۴. **سه پیشنهاد عملیاتی**: برای افزایش سود.
+                    
+                    از ایموجی‌های مناسب برای هر تیتر استفاده کن و متن را به گونه‌ای بنویس که در یک داشبورد بسیار شیک و خوانا به نظر برسد.
+                    """
+                    try:
+                        response = model.generate_content(prompt)
+                        st.markdown(f'<div class="ai-report-card">{response.text}</div>', unsafe_allow_html=True)
+                    except Exception as e:
+                        st.error(f"خطا در تولید گزارش هوشمند: {e}")
 
 # ---------- TAB: AI assistant (chat) ----------
 elif st.session_state.active_tab == "دستیار هوش مصنوعی":
-    section_label("🧠 دستیار هوش مصنوعی")
+    section_label("🧠 گفتگوی آزاد با دستیار مالی")
+    st.write("در اینجا می‌توانید هرگونه سوال دلخواهی را درباره وضعیت مالی خود از هوش مصنوعی بپرسید.")
 
     model = get_model()
     if not model:
         st.warning("ابتدا کلید API را در تب تنظیمات وارد کنید.")
     else:
-        if st.session_state.pending_auto_analysis and st.session_state.clean_data is not None:
-            st.session_state.pending_auto_analysis = False
-            cd = st.session_state.clean_data
-            total_income = cd["income"].sum()
-            total_expense = cd["expense"].sum()
-            total_profit = cd["profit"].sum()
-            with st.spinner("در حال تولید تحلیل اولیه..."):
-                prompt = f"""
-                You are an expert financial advisor. Review this financial summary:
-                Total Income: {total_income}
-                Total Expenses: {total_expense}
-                Net Profit: {total_profit}
-
-                Write a short, professional analysis in Persian (فارسی).
-                Highlight any concerns, praise good margins, and give 3 actionable tips
-                for the manager to improve profitability based on these numbers.
-                """
-                try:
-                    response = model.generate_content(prompt)
-                    st.session_state.chat_history.append({"role": "user", "content": "لطفا وضعیت مالی من را تحلیل کن."})
-                    st.session_state.chat_history.append({"role": "assistant", "content": response.text})
-                except Exception as e:
-                    st.error(f"خطا در تولید تحلیل: {e}")
-
         for msg in st.session_state.chat_history:
             avatar = "🧑" if msg["role"] == "user" else "🧠"
             with st.chat_message(msg["role"], avatar=avatar):
@@ -534,7 +587,7 @@ elif st.session_state.active_tab == "دستیار هوش مصنوعی":
             ]
 
             with st.chat_message("assistant", avatar="🧠"):
-                with st.spinner("در حال فکر کردن..."):
+                with st.spinner("در حال پردازش..."):
                     try:
                         chat = model.start_chat(history=history_for_api)
                         response = chat.send_message(
