@@ -1,9 +1,12 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-import google.generativeai as genai
 import json
 import re
+import google.generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
+from langchain.agents import create_agent
 
 st.set_page_config(page_title="داشبورد هوشمند مالی", layout="wide", page_icon="📊")
 
@@ -168,6 +171,42 @@ def section_label(text):
     st.markdown(f'<div class="section-label">{text}</div>', unsafe_allow_html=True)
 
 
+# ---------- Robust numeric cleaning ----------
+def to_western_digits(s: str) -> str:
+    persian = "۰۱۲۳۴۵۶۷۸۹"
+    arabic = "٠١٢٣٤٥٦٧٨٩"
+    for i, d in enumerate(persian):
+        s = s.replace(d, str(i))
+    for i, d in enumerate(arabic):
+        s = s.replace(d, str(i))
+    return s
+
+
+def clean_number(val) -> float:
+    """Parses messy real-world numbers: Persian/Arabic digits, currency symbols,
+    thousands separators (، ٬ , space), and parentheses meaning negative."""
+    if pd.isna(val):
+        return 0.0
+    s = str(val).strip()
+    if s == "":
+        return 0.0
+    s = to_western_digits(s)
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1]
+    if s.strip().startswith("-"):
+        negative = True
+    s = re.sub(r"[^\d.]", "", s)
+    if s in ("", "."):
+        return 0.0
+    try:
+        num = float(s)
+    except ValueError:
+        return 0.0
+    return -abs(num) if negative else num
+
+
 # ---------- Session state defaults ----------
 defaults = {
     "api_key": st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else "",
@@ -190,6 +229,73 @@ def get_model():
     return genai.GenerativeModel("gemini-3.5-flash-lite")
 
 
+# ---------- Finance agent: real tools instead of guessed numbers ----------
+@tool
+def get_financial_summary() -> str:
+    """خلاصه کلی وضعیت مالی شامل کل درآمد، کل هزینه و سود خالص را برمی‌گرداند."""
+    cd = st.session_state.get("clean_data")
+    if cd is None:
+        return "هنوز داده مالی بارگذاری نشده است."
+    return (
+        f"کل درآمد: {cd['income'].sum():,.0f}\n"
+        f"کل هزینه: {cd['expense'].sum():,.0f}\n"
+        f"سود خالص: {cd['profit'].sum():,.0f}"
+    )
+
+
+@tool
+def get_profit_loss_by_item() -> str:
+    """گزارش سود و زیان را به تفکیک هر آیتم یا دسته‌بندی مالی (در صورت وجود در فایل) برمی‌گرداند."""
+    cd = st.session_state.get("clean_data")
+    if cd is None:
+        return "هنوز داده مالی بارگذاری نشده است."
+    if "category" not in cd.columns or cd["category"].isna().all():
+        return "داده‌ای برای تفکیک بر اساس آیتم موجود نیست؛ فقط جمع کل درآمد و هزینه در دسترس است."
+    g = cd.groupby("category")[["income", "expense"]].sum()
+    g["سود"] = g["income"] - g["expense"]
+    g = g.sort_values("سود", ascending=False)
+    return g.to_string()
+
+
+@tool
+def get_sales_trend() -> str:
+    """روند فروش (درآمد) را به تفکیک تاریخ برمی‌گرداند تا رشد یا افت فروش در طول زمان بررسی شود."""
+    cd = st.session_state.get("clean_data")
+    if cd is None:
+        return "هنوز داده مالی بارگذاری نشده است."
+    if "date" not in cd.columns or cd["date"].isna().all():
+        return "اطلاعات تاریخ در داده موجود نیست."
+    trend = cd.groupby(cd["date"].dt.date)["income"].sum()
+    return trend.to_string()
+
+
+FINANCE_SYSTEM_PROMPT = """
+شما یک دستیار مدیریت مالی هوشمند برای یک مدیر کسب‌وکار فارسی‌زبان هستید.
+همیشه به زبان فارسی و به‌صورت حرفه‌ای پاسخ بده.
+
+هر وقت برای پاسخ به عدد یا آمار واقعی نیاز داری (کل درآمد، کل هزینه، سود خالص، تفکیک سود و زیان
+بر اساس آیتم، یا روند فروش در طول زمان)، حتما از ابزارهای موجود استفاده کن و هرگز عدد را حدس نزن
+یا از خودت نساز.
+
+اگر کاربر خواست پیشنهاد بازاریابی یا محتوای تبلیغاتی با ذهنیت و سبک یک فرد مشخص ارائه بدهی
+(مثلا David Ogilvy، Conrad Gessner یا هر متخصص دیگر)، ابتدا با ابزارها زمینه و اعداد واقعی مالی
+را به‌دست بیاور، سپس پاسخ نهایی را دقیقا با سبک نوشتاری، لحن و طرز فکر همان شخص بنویس - نه فقط
+اسم او را ذکر کن.
+"""
+
+
+def get_finance_agent():
+    if not st.session_state.api_key:
+        return None
+    model = ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash-lite",
+        google_api_key=st.session_state.api_key,
+        temperature=0.4,
+    )
+    tools = [get_financial_summary, get_profit_loss_by_item, get_sales_trend]
+    return create_agent(model, tools=tools, system_prompt=FINANCE_SYSTEM_PROMPT)
+
+
 def extract_json(text: str) -> dict:
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
@@ -202,6 +308,124 @@ def go_to(tab_name, **flags):
     for k, v in flags.items():
         st.session_state[k] = v
     st.rerun()
+
+
+def detect_structure(model, raw_data: pd.DataFrame) -> dict:
+    """Ask the AI to inspect headers AND a few sample rows, then classify the
+    file into one of three common financial-spreadsheet shapes."""
+    columns = list(raw_data.columns)
+    sample_rows = raw_data.head(4).astype(str).to_dict(orient="records")
+    prompt = f"""
+    You are analyzing a financial spreadsheet.
+    Column headers: {columns}
+    Sample rows (first {len(sample_rows)}): {json.dumps(sample_rows, ensure_ascii=False)}
+
+    Headers and values may be in Persian, English, or mixed, and naming can vary a lot
+    between files. Decide which of these three shapes the data actually has, and
+    return ONLY a JSON object matching exactly one shape below (no markdown, no commentary):
+
+    1) Separate income and expense columns:
+    {{"structure": "separate_columns", "date_column": "<col name or null>", "income_column": "<col name>", "expense_column": "<col name>", "category_column": "<col name or null>"}}
+
+    2) A single signed amount column (positive means income, negative means expense, or vice versa):
+    {{"structure": "single_amount", "date_column": "<col name or null>", "amount_column": "<col name>", "sign_convention": "positive_is_income" or "negative_is_income", "category_column": "<col name or null>"}}
+
+    3) A single amount column plus a text category/type column that says whether each row is income or expense:
+    {{"structure": "amount_with_type", "date_column": "<col name or null>", "amount_column": "<col name>", "type_column": "<col name>", "income_values": ["value1", "value2"], "expense_values": ["value1", "value2"], "category_column": "<col name or null>"}}
+
+    In every shape, "category_column" is optional: if there is any column describing WHAT each
+    transaction is for (e.g. "شرح", "دسته‌بندی", "توضیحات", "شرح تراکنش", item/description/category
+    name — NOT the same thing as the income/expense classification itself), name it there so the
+    individual items can be broken down later. If no such column exists, use null.
+
+    Pick whichever shape genuinely matches the sample data. Return ONLY the JSON object.
+    """
+    response = model.generate_content(prompt)
+    return extract_json(response.text)
+
+
+def resolve_column(df: pd.DataFrame, name):
+    """Matches an AI-returned column name to the real dataframe column, even if
+    it differs by whitespace, case, or Persian/Arabic Yeh-Kaf variants."""
+    if name is None:
+        return None
+    name = str(name)
+    if name in df.columns:
+        return name
+
+    def normalize(s):
+        s = str(s).strip()
+        s = s.replace("ي", "ی").replace("ك", "ک")
+        s = re.sub(r"\s+", " ", s)
+        return s.lower()
+
+    target = normalize(name)
+    for col in df.columns:
+        if normalize(col) == target:
+            return col
+
+    raise KeyError(f"ستون «{name}» در فایل پیدا نشد.")
+
+
+def build_clean_data(raw_data: pd.DataFrame, structure: dict) -> pd.DataFrame:
+    """Turns raw_data into a dataframe with income/expense/profit columns,
+    based on whichever structure the AI detected."""
+    df = raw_data.copy()
+    kind = structure.get("structure")
+    date_col = resolve_column(df, structure.get("date_column"))
+
+    if kind == "separate_columns":
+        income_col = resolve_column(df, structure["income_column"])
+        expense_col = resolve_column(df, structure["expense_column"])
+        df["income"] = df[income_col].apply(clean_number)
+        df["expense"] = df[expense_col].apply(clean_number).abs()
+
+    elif kind == "single_amount":
+        amount_col = resolve_column(df, structure["amount_column"])
+        convention = structure.get("sign_convention", "positive_is_income")
+        amounts = df[amount_col].apply(clean_number)
+        if convention == "positive_is_income":
+            df["income"] = amounts.clip(lower=0)
+            df["expense"] = (-amounts.clip(upper=0))
+        else:
+            df["income"] = (-amounts.clip(upper=0))
+            df["expense"] = amounts.clip(lower=0)
+
+    elif kind == "amount_with_type":
+        amount_col = resolve_column(df, structure["amount_column"])
+        type_col = resolve_column(df, structure["type_column"])
+        income_values = set(str(v).strip().lower() for v in structure.get("income_values", []))
+        expense_values = set(str(v).strip().lower() for v in structure.get("expense_values", []))
+        amounts = df[amount_col].apply(clean_number).abs()
+        types = df[type_col].astype(str).str.strip().str.lower()
+        df["income"] = amounts.where(types.isin(income_values), 0.0)
+        df["expense"] = amounts.where(types.isin(expense_values), 0.0)
+
+    else:
+        raise ValueError("ساختار شناسایی‌شده پشتیبانی نمی‌شود.")
+
+    df["profit"] = df["income"] - df["expense"]
+
+    category_col = None
+    try:
+        category_col = resolve_column(df, structure.get("category_column"))
+    except KeyError:
+        category_col = None
+    if category_col:
+        df["category"] = df[category_col].astype(str).str.strip()
+    elif kind == "amount_with_type":
+        # No separate category column, but the type column itself often carries
+        # the itemized label (e.g. "حقوق", "اجاره"), so fall back to it.
+        df["category"] = df[structure["type_column"]].astype(str).str.strip()
+    else:
+        df["category"] = None
+
+    if date_col and date_col in df.columns:
+        df = df.rename(columns={date_col: "date"})
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.sort_values("date")
+
+    return df
 
 
 # ---------- Sidebar navigation ----------
@@ -281,38 +505,23 @@ elif st.session_state.active_tab == "بارگذاری داده":
                 if not model:
                     st.error("ابتدا کلید API را در تب تنظیمات وارد کنید.")
                 else:
-                    with st.spinner("در حال یکسان‌سازی ستون‌ها..."):
-                        mapping = None
+                    structure = None
+                    with st.spinner("در حال شناسایی ساختار داده..."):
                         try:
-                            columns = list(raw_data.columns)
-                            prompt = f"""
-                            Look at these column headers from a user's financial file: {columns}.
-                            They might be in English, Persian, or any language.
-                            Map them to these standard keys: 'date', 'income', 'expense'.
-                            Only include a key if you find a clearly matching column.
-                            Return ONLY a valid JSON object mapping the original column names to the standard keys.
-                            """
-                            response = model.generate_content(prompt)
-                            mapping = extract_json(response.text)
+                            structure = detect_structure(model, raw_data)
                         except Exception as e:
-                            st.error(f"خطا در تحلیل ستون‌ها: {e}")
+                            st.error(f"خطا در تحلیل ساختار داده: {e}")
 
-                    if mapping:
-                        missing = [k for k in ("income", "expense") if k not in mapping.values()]
-                        if missing:
-                            st.error("این ستون‌ها شناسایی نشدند: " + "، ".join(missing))
-                        else:
-                            clean_data = raw_data.rename(columns=mapping)
-                            clean_data["income"] = pd.to_numeric(clean_data["income"], errors="coerce").fillna(0)
-                            clean_data["expense"] = pd.to_numeric(clean_data["expense"], errors="coerce").fillna(0)
-                            clean_data["profit"] = clean_data["income"] - clean_data["expense"]
-                            if "date" in clean_data.columns:
-                                clean_data["date"] = pd.to_datetime(clean_data["date"], errors="coerce")
-                                clean_data = clean_data.sort_values("date")
+                    if structure:
+                        try:
+                            clean_data = build_clean_data(raw_data, structure)
                             st.session_state.clean_data = clean_data
-                            st.session_state.column_mapping = mapping
+                            st.session_state.column_mapping = structure
                             st.success("داده با موفقیت پردازش شد. اکنون به تب داشبورد بروید.")
-                            st.json(mapping)
+                            with st.expander("جزئیات ساختار شناسایی‌شده توسط هوش مصنوعی"):
+                                st.json(structure)
+                        except Exception as e:
+                            st.error(f"خطا در ساخت داده تمیز: {e}")
 
 # ---------- TAB: dashboard ----------
 elif st.session_state.active_tab == "داشبورد":
@@ -340,7 +549,25 @@ elif st.session_state.active_tab == "داشبورد":
             chart_data = clean_data.set_index("date")[["income", "expense"]]
         else:
             chart_data = clean_data[["income", "expense"]]
+        chart_data = chart_data.rename(columns={"income": "درآمد", "expense": "هزینه"})
         st.bar_chart(chart_data, color=[TEAL, BRICK])
+
+        has_categories = (
+            "category" in clean_data.columns
+            and clean_data["category"].notna().any()
+            and clean_data["category"].nunique() > 1
+        )
+        if has_categories:
+            section_label("جزئیات آیتم‌ها")
+            breakdown = (
+                clean_data.groupby("category")[["income", "expense"]]
+                .sum()
+                .assign(تعداد=clean_data.groupby("category").size())
+                .rename(columns={"income": "درآمد", "expense": "هزینه"})
+                .sort_values("درآمد", ascending=False)
+            )
+            st.dataframe(breakdown, use_container_width=True)
+            st.bar_chart(breakdown[["درآمد", "هزینه"]], color=[TEAL, BRICK])
 
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🧠 تحلیل با هوش مصنوعی", type="primary"):
@@ -350,31 +577,19 @@ elif st.session_state.active_tab == "داشبورد":
 elif st.session_state.active_tab == "دستیار هوش مصنوعی":
     section_label("🧠 دستیار هوش مصنوعی")
 
-    model = get_model()
-    if not model:
+    agent = get_finance_agent()
+    if not agent:
         st.warning("ابتدا کلید API را در تب تنظیمات وارد کنید.")
     else:
         if st.session_state.pending_auto_analysis and st.session_state.clean_data is not None:
             st.session_state.pending_auto_analysis = False
-            cd = st.session_state.clean_data
-            total_income = cd["income"].sum()
-            total_expense = cd["expense"].sum()
-            total_profit = cd["profit"].sum()
+            user_prompt = "لطفا وضعیت مالی من را تحلیل کن، نقاط قوت و نگرانی‌ها را بگو و ۳ پیشنهاد عملی بده."
             with st.spinner("در حال تولید تحلیل اولیه..."):
-                prompt = f"""
-                You are an expert financial advisor. Review this financial summary:
-                Total Income: {total_income}
-                Total Expenses: {total_expense}
-                Net Profit: {total_profit}
-
-                Write a short, professional analysis in Persian (فارسی).
-                Highlight any concerns, praise good margins, and give 3 actionable tips
-                for the manager to improve profitability based on these numbers.
-                """
                 try:
-                    response = model.generate_content(prompt)
+                    result = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]})
+                    reply = result["messages"][-1].content
                     st.session_state.chat_history.append({"role": "user", "content": "لطفا وضعیت مالی من را تحلیل کن."})
-                    st.session_state.chat_history.append({"role": "assistant", "content": response.text})
+                    st.session_state.chat_history.append({"role": "assistant", "content": reply})
                 except Exception as e:
                     st.error(f"خطا در تولید تحلیل: {e}")
 
@@ -389,28 +604,17 @@ elif st.session_state.active_tab == "دستیار هوش مصنوعی":
             with st.chat_message("user", avatar="🧑"):
                 st.write(user_msg)
 
-            context_note = ""
-            if st.session_state.clean_data is not None:
-                cd = st.session_state.clean_data
-                context_note = (
-                    f"\n(Context: total income {cd['income'].sum()}, "
-                    f"total expense {cd['expense'].sum()}, "
-                    f"total profit {cd['profit'].sum()}.)"
-                )
-
-            history_for_api = [
-                {"role": "user" if m["role"] == "user" else "model", "parts": [m["content"]]}
-                for m in st.session_state.chat_history[:-1]
+            messages_for_agent = [
+                {"role": "user" if m["role"] == "user" else "assistant", "content": m["content"]}
+                for m in st.session_state.chat_history
             ]
 
             with st.chat_message("assistant", avatar="🧠"):
                 with st.spinner("در حال فکر کردن..."):
                     try:
-                        chat = model.start_chat(history=history_for_api)
-                        response = chat.send_message(
-                            "Answer in Persian, as a financial advisor. " + user_msg + context_note
-                        )
-                        st.write(response.text)
-                        st.session_state.chat_history.append({"role": "assistant", "content": response.text})
+                        result = agent.invoke({"messages": messages_for_agent})
+                        reply = result["messages"][-1].content
+                        st.write(reply)
+                        st.session_state.chat_history.append({"role": "assistant", "content": reply})
                     except Exception as e:
                         st.error(f"خطا: {e}")
