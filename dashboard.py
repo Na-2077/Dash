@@ -3,6 +3,8 @@ import streamlit.components.v1 as components
 import pandas as pd
 import json
 import re
+import sqlite3
+from datetime import date, datetime
 import google.generativeai as genai
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
@@ -428,6 +430,103 @@ def build_clean_data(raw_data: pd.DataFrame, structure: dict) -> pd.DataFrame:
     return df
 
 
+# ---------- HR: task management (SQLite-backed, survives restarts) ----------
+TASKS_DB_PATH = "tasks.db"
+
+
+def get_tasks_db():
+    conn = sqlite3.connect(TASKS_DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            assignee TEXT,
+            description TEXT,
+            due_date TEXT,
+            priority TEXT,
+            status TEXT DEFAULT 'در حال انجام',
+            created_at TEXT
+        )
+    """)
+    return conn
+
+
+def add_task(title, assignee, description, due_date_val, priority):
+    conn = get_tasks_db()
+    conn.execute(
+        "INSERT INTO tasks (title, assignee, description, due_date, priority, status, created_at) VALUES (?,?,?,?,?,?,?)",
+        (
+            title, assignee, description,
+            due_date_val.isoformat() if due_date_val else None,
+            priority, "در حال انجام", datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_tasks(status_filter=None) -> pd.DataFrame:
+    conn = get_tasks_db()
+    query = "SELECT id, title, assignee, description, due_date, priority, status FROM tasks"
+    params = ()
+    if status_filter and status_filter != "همه":
+        query += " WHERE status = ?"
+        params = (status_filter,)
+    query += " ORDER BY due_date IS NULL, due_date ASC"
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+
+def update_task_status(task_id, new_status):
+    conn = get_tasks_db()
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (new_status, task_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_task(task_id):
+    conn = get_tasks_db()
+    conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_due_soon_tasks(days_ahead: int = 3) -> pd.DataFrame:
+    """Tasks that are overdue or due within `days_ahead` days, excluding completed ones."""
+    df = get_tasks()
+    if df.empty:
+        return df
+    df = df[df["status"] != "انجام‌شده"].copy()
+    df["due_date_parsed"] = pd.to_datetime(df["due_date"], errors="coerce")
+    today = pd.Timestamp(date.today())
+    df["روز باقیمانده"] = (df["due_date_parsed"] - today).dt.days
+    return df[df["روز باقیمانده"] <= days_ahead].sort_values("روز باقیمانده")
+
+
+def generate_reminder_message(task_row) -> str:
+    """Uses the plain Gemini model (not the agent) to draft a short, friendly
+    Persian reminder message for one task."""
+    model = get_model()
+    if not model:
+        return "ابتدا کلید API را در تب تنظیمات وارد کنید."
+    due = task_row.get("due_date") or "نامشخص"
+    prompt = f"""
+    یک پیام یادآوری کوتاه، محترمانه و حرفه‌ای به زبان فارسی برای یک همکار بنویس.
+    عنوان تسک: {task_row.get('title')}
+    مسئول تسک: {task_row.get('assignee') or 'نامشخص'}
+    مهلت انجام: {due}
+    اولویت: {task_row.get('priority') or 'نامشخص'}
+    پیام باید کوتاه (حداکثر ۴-۵ خط)، مودبانه و مستقیم باشد و لحن دستوری تند نداشته باشد.
+    فقط متن پیام را بنویس، بدون توضیح اضافه.
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"خطا در تولید پیام: {e}"
+
+
 # ---------- Sidebar navigation ----------
 with st.sidebar:
     st.markdown(f"<p style='font-family:Lalezar; font-size:22px; margin-bottom:2px;'>📊 مالی هوشمند</p>", unsafe_allow_html=True)
@@ -438,6 +537,7 @@ with st.sidebar:
         ("داشبورد", "📊"),
         ("بارگذاری داده", "📁"),
         ("دستیار هوش مصنوعی", "🧠"),
+        ("منابع انسانی", "👥"),
         ("تنظیمات", "⚙️"),
     ]
     for name, icon in nav_items:
@@ -618,3 +718,76 @@ elif st.session_state.active_tab == "دستیار هوش مصنوعی":
                         st.session_state.chat_history.append({"role": "assistant", "content": reply})
                     except Exception as e:
                         st.error(f"خطا: {e}")
+
+# ---------- TAB: HR / task management ----------
+elif st.session_state.active_tab == "منابع انسانی":
+    section_label("👥 منابع انسانی — تسک‌ها و یادآوری")
+
+    due_soon = get_due_soon_tasks(days_ahead=3)
+    if not due_soon.empty:
+        overdue = due_soon[due_soon["روز باقیمانده"] < 0]
+        upcoming = due_soon[due_soon["روز باقیمانده"] >= 0]
+        if not overdue.empty:
+            names = "، ".join(overdue["title"].tolist())
+            st.error(f"⏰ {len(overdue)} تسک از سررسید گذشته: {names}")
+        if not upcoming.empty:
+            names = "، ".join(upcoming["title"].tolist())
+            st.warning(f"🔔 {len(upcoming)} تسک تا ۳ روز آینده سررسید دارد: {names}")
+
+    section_label("افزودن تسک جدید")
+    with st.form("add_task_form", clear_on_submit=True):
+        fc1, fc2 = st.columns(2)
+        title = fc1.text_input("عنوان تسک")
+        assignee = fc2.text_input("مسئول تسک")
+        description = st.text_area("توضیحات (اختیاری)", height=80)
+        fc3, fc4 = st.columns(2)
+        due_date_val = fc3.date_input("مهلت انجام", value=None)
+        priority = fc4.selectbox("اولویت", ["پایین", "متوسط", "بالا"], index=1)
+        submitted = st.form_submit_button("افزودن تسک", type="primary")
+        if submitted:
+            if not title.strip():
+                st.error("عنوان تسک الزامی است.")
+            else:
+                add_task(title.strip(), assignee.strip(), description.strip(), due_date_val, priority)
+                st.success("تسک اضافه شد.")
+                st.rerun()
+
+    section_label("لیست تسک‌ها")
+    status_choice = st.selectbox("فیلتر وضعیت", ["همه", "در حال انجام", "انجام‌شده"], key="task_status_filter")
+    tasks_df = get_tasks(status_choice)
+
+    if tasks_df.empty:
+        st.info("هنوز تسکی ثبت نشده است.")
+    else:
+        for _, row in tasks_df.iterrows():
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 1, 1])
+                with c1:
+                    st.markdown(f"**{row['title']}**")
+                    meta = []
+                    if row["assignee"]:
+                        meta.append(f"مسئول: {row['assignee']}")
+                    if row["due_date"]:
+                        meta.append(f"مهلت: {row['due_date']}")
+                    meta.append(f"اولویت: {row['priority']}")
+                    meta.append(f"وضعیت: {row['status']}")
+                    st.caption(" | ".join(meta))
+                    if row["description"]:
+                        st.write(row["description"])
+                with c2:
+                    if row["status"] != "انجام‌شده":
+                        if st.button("✅ تکمیل شد", key=f"done_{row['id']}", use_container_width=True):
+                            update_task_status(row["id"], "انجام‌شده")
+                            st.rerun()
+                    else:
+                        if st.button("↩️ بازگردانی", key=f"undo_{row['id']}", use_container_width=True):
+                            update_task_status(row["id"], "در حال انجام")
+                            st.rerun()
+                    if st.button("🗑️ حذف", key=f"del_{row['id']}", use_container_width=True):
+                        delete_task(row["id"])
+                        st.rerun()
+                with c3:
+                    if st.button("✉️ متن یادآوری", key=f"remind_{row['id']}", use_container_width=True):
+                        with st.spinner("در حال نوشتن پیام..."):
+                            msg = generate_reminder_message(row)
+                        st.text_area("پیام آماده (کپی کنید)", value=msg, height=120, key=f"msg_{row['id']}")
