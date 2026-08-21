@@ -3,6 +3,9 @@ import streamlit.components.v1 as components
 import pandas as pd
 import json
 import re
+import sqlite3
+import requests
+from datetime import date, datetime
 import google.generativeai as genai
 import plotly.express as px
 import plotly.graph_objects as go
@@ -228,12 +231,14 @@ def clean_number(val) -> float:
 # ---------- Session state defaults ----------
 defaults = {
     "api_key": st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else "",
+    "telegram_token": st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else "",
     "active_tab": "داشبورد",
     "raw_data": None,
     "clean_data": None,
     "column_mapping": None,
     "chat_history": [],
     "pending_auto_analysis": False,
+    "new_telegram_senders": {},
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -244,7 +249,7 @@ def get_model():
     if not st.session_state.api_key:
         return None
     genai.configure(api_key=st.session_state.api_key)
-    return genai.GenerativeModel("gemini-3.5-flash-lite") # بروزرسانی نام مدل به نسخه معتبر و سریع
+    return genai.GenerativeModel("gemini-3.5-flash-lite")  # بروزرسانی نام مدل به نسخه معتبر و سریع
 
 
 def extract_json(text: str) -> dict:
@@ -346,6 +351,182 @@ def build_clean_data(raw_data: pd.DataFrame, structure: dict) -> pd.DataFrame:
     return df
 
 
+# ================= Telegram task module =================
+TASKS_DB_PATH = "tasks.db"
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+
+
+def get_tasks_db():
+    conn = sqlite3.connect(TASKS_DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            chat_id TEXT UNIQUE NOT NULL,
+            username TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            assignee_id INTEGER,
+            due_date TEXT,
+            priority TEXT,
+            status TEXT DEFAULT 'ارسال‌شده',
+            created_at TEXT,
+            FOREIGN KEY(assignee_id) REFERENCES employees(id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    return conn
+
+
+def tg_call(method, **params):
+    """Low-level call to the Telegram Bot API. Returns the parsed JSON response,
+    or a dict with ok=False if the request itself failed (e.g. no internet, bad token)."""
+    token = st.session_state.get("telegram_token")
+    if not token:
+        return {"ok": False, "description": "توکن ربات تنظیم نشده است."}
+    try:
+        r = requests.post(
+            TELEGRAM_API.format(token=token, method=method),
+            json={k: v for k, v in params.items() if v is not None},
+            timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+
+def tg_get_updates():
+    """Long-poll-free fetch of new Telegram updates since the last processed offset."""
+    conn = get_tasks_db()
+    row = conn.execute("SELECT value FROM telegram_state WHERE key='offset'").fetchone()
+    conn.close()
+    offset = int(row[0]) + 1 if row else None
+    result = tg_call("getUpdates", offset=offset, timeout=0)
+    if not result or not result.get("ok"):
+        return []
+    updates = result.get("result", [])
+    if updates:
+        max_id = max(u["update_id"] for u in updates)
+        conn = get_tasks_db()
+        conn.execute("INSERT OR REPLACE INTO telegram_state (key, value) VALUES ('offset', ?)", (str(max_id),))
+        conn.commit()
+        conn.close()
+    return updates
+
+
+def tg_send_task_message(chat_id, task_id, title, description, due_date_val, priority):
+    text = f"📌 تسک جدید: {title}\n"
+    if description:
+        text += f"📝 {description}\n"
+    if due_date_val:
+        text += f"📅 مهلت: {due_date_val}\n"
+    text += f"⭐ اولویت: {priority}\n\nوقتی انجامش دادید، روی دکمه زیر بزنید 👇"
+    reply_markup = {"inline_keyboard": [[{"text": "✅ انجام شد", "callback_data": f"done:{task_id}"}]]}
+    return tg_call("sendMessage", chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+
+def tg_answer_callback(callback_query_id, text):
+    return tg_call("answerCallbackQuery", callback_query_id=callback_query_id, text=text)
+
+
+def add_employee(name, chat_id, username=None):
+    conn = get_tasks_db()
+    try:
+        conn.execute(
+            "INSERT INTO employees (name, chat_id, username) VALUES (?,?,?)",
+            (name, str(chat_id), username),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    conn.close()
+
+
+def get_employees() -> pd.DataFrame:
+    conn = get_tasks_db()
+    df = pd.read_sql_query("SELECT * FROM employees", conn)
+    conn.close()
+    return df
+
+
+def get_registered_chat_ids() -> set:
+    df = get_employees()
+    return set(df["chat_id"].astype(str)) if not df.empty else set()
+
+
+def add_task_and_notify(title, description, employee_row, due_date_val, priority):
+    conn = get_tasks_db()
+    cur = conn.execute(
+        "INSERT INTO tasks (title, description, assignee_id, due_date, priority, status, created_at) VALUES (?,?,?,?,?,?,?)",
+        (
+            title, description, int(employee_row["id"]),
+            due_date_val.isoformat() if due_date_val else None,
+            priority, "ارسال‌شده", datetime.now().isoformat(),
+        ),
+    )
+    task_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    result = tg_send_task_message(
+        employee_row["chat_id"], task_id, title, description, due_date_val, priority
+    )
+    return task_id, result
+
+
+def get_tasks_with_employee() -> pd.DataFrame:
+    conn = get_tasks_db()
+    df = pd.read_sql_query("""
+        SELECT tasks.id, tasks.title, tasks.description, tasks.due_date, tasks.priority, tasks.status,
+               employees.name AS assignee, employees.chat_id AS assignee_chat_id
+        FROM tasks LEFT JOIN employees ON tasks.assignee_id = employees.id
+        ORDER BY tasks.id DESC
+    """, conn)
+    conn.close()
+    return df
+
+
+def process_telegram_updates():
+    """Poll Telegram for new 'done' button presses and mark matching tasks complete.
+    Verifies the chat_id that pressed the button actually matches the task's assignee,
+    so one employee can't mark another's task as done."""
+    updates = tg_get_updates()
+    confirmed = []
+    for u in updates:
+        cq = u.get("callback_query")
+        if not cq:
+            continue
+        data = cq.get("data", "")
+        if not data.startswith("done:"):
+            continue
+        task_id = data.split(":", 1)[1]
+        chat_id = str(cq["from"]["id"])
+        conn = get_tasks_db()
+        row = conn.execute("""
+            SELECT tasks.id, employees.chat_id FROM tasks
+            JOIN employees ON tasks.assignee_id = employees.id
+            WHERE tasks.id = ?
+        """, (task_id,)).fetchone()
+        if row and str(row[1]) == chat_id:
+            conn.execute("UPDATE tasks SET status='انجام‌شده' WHERE id=?", (task_id,))
+            conn.commit()
+            confirmed.append(task_id)
+            tg_answer_callback(cq["id"], "✅ ثبت شد، ممنون!")
+        else:
+            tg_answer_callback(cq["id"], "⚠️ این تسک برای شما نیست.")
+        conn.close()
+    return confirmed
+
+
 # ---------- Sidebar navigation ----------
 with st.sidebar:
     st.markdown(f"<p style='font-family:Lalezar; font-size:22px; margin-bottom:2px;'>📊 مالی هوشمند</p>", unsafe_allow_html=True)
@@ -356,6 +537,7 @@ with st.sidebar:
         ("داشبورد", "📊"),
         ("بارگذاری داده", "📁"),
         ("دستیار هوش مصنوعی", "🧠"),
+        ("تسک‌های تلگرام", "🧑‍💼"),
         ("تنظیمات", "⚙️"),
     ]
     for name, icon in nav_items:
@@ -394,6 +576,22 @@ if st.session_state.active_tab == "تنظیمات":
                 st.success(f"اتصال موفق بود. پاسخ نمونه: {r.text.strip()}")
             except Exception as e:
                 st.error(f"اتصال ناموفق: {e}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    section_label("🤖 توکن ربات تلگرام")
+    st.write("توکن را از @BotFather در تلگرام بگیرید (دستور /newbot). این توکن هم فقط در حافظه این نشست می‌ماند.")
+    tg_input = st.text_input("Telegram Bot Token", value=st.session_state.telegram_token, type="password")
+    tc1, tc2 = st.columns(2)
+    if tc1.button("ذخیره توکن", type="primary", use_container_width=True):
+        st.session_state.telegram_token = tg_input
+        st.success("توکن ذخیره شد.")
+    if tc2.button("تست ربات", use_container_width=True):
+        result = tg_call("getMe")
+        if result and result.get("ok"):
+            bot_name = result["result"].get("username", "؟")
+            st.success(f"اتصال موفق بود. نام ربات: @{bot_name}")
+        else:
+            st.error(f"اتصال ناموفق: {result.get('description') if result else 'خطای نامشخص'}")
 
 # ---------- TAB: data upload ----------
 elif st.session_state.active_tab == "بارگذاری داده":
@@ -463,10 +661,10 @@ elif st.session_state.active_tab == "داشبورد":
             metric_card("سود خالص", total_profit, "📈", GOLD, index=2)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        
+
         # --- نمودارهای حرفه‌ای با Plotly ---
         section_label("📊 تحلیل بصری داده‌ها")
-        
+
         has_date = "date" in clean_data.columns
         has_categories = (
             "category" in clean_data.columns
@@ -474,7 +672,6 @@ elif st.session_state.active_tab == "داشبورد":
             and clean_data["category"].nunique() > 1
         )
 
-        # 1. نمودار روند زمانی (مساحتی)
         if has_date:
             time_data = clean_data.groupby("date")[["income", "expense"]].sum().reset_index()
             fig_time = px.area(time_data, x="date", y=["income", "expense"],
@@ -482,19 +679,17 @@ elif st.session_state.active_tab == "داشبورد":
                                color_discrete_map={"income": TEAL, "expense": BRICK},
                                title="روند درآمد و هزینه در گذر زمان")
             fig_time.update_layout(font_family="Vazirmatn", title_x=0.5, legend_title_text="", hovermode="x unified")
-            newnames = {'income':'درآمد', 'expense': 'هزینه'}
-            fig_time.for_each_trace(lambda t: t.update(name = newnames.get(t.name, t.name),
-                                                       legendgroup = newnames.get(t.name, t.name),
-                                                       hovertemplate = t.hovertemplate.replace(t.name, newnames.get(t.name, t.name))))
+            newnames = {'income': 'درآمد', 'expense': 'هزینه'}
+            fig_time.for_each_trace(lambda t: t.update(name=newnames.get(t.name, t.name),
+                                                       legendgroup=newnames.get(t.name, t.name),
+                                                       hovertemplate=t.hovertemplate.replace(t.name, newnames.get(t.name, t.name))))
             st.plotly_chart(fig_time, use_container_width=True)
 
-        # 2. نمودارهای دسته‌بندی (دونات و میله‌ای گروهی)
         if has_categories:
             breakdown = clean_data.groupby("category")[["income", "expense"]].sum()
-            
+
             c1, c2 = st.columns(2)
             with c1:
-                # نمودار دونات برای ترکیب هزینه‌ها
                 exp_data = breakdown[breakdown["expense"] > 0].reset_index()
                 if not exp_data.empty:
                     fig_pie = px.pie(exp_data, values="expense", names="category", hole=0.4,
@@ -504,9 +699,8 @@ elif st.session_state.active_tab == "داشبورد":
                     st.plotly_chart(fig_pie, use_container_width=True)
                 else:
                     st.info("هزینه‌ای برای نمایش ترکیب وجود ندارد.")
-                    
+
             with c2:
-                # نمودار میله‌ای مقایسه‌ای
                 breakdown_reset = breakdown.reset_index().sort_values("income", ascending=False)
                 fig_bar = go.Figure(data=[
                     go.Bar(name='درآمد', x=breakdown_reset['category'], y=breakdown_reset['income'], marker_color=TEAL),
@@ -517,11 +711,10 @@ elif st.session_state.active_tab == "داشبورد":
                 st.plotly_chart(fig_bar, use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        
-        # --- بخش تحلیل تمیز و اختصاصی هوش مصنوعی در همان داشبورد ---
+
         section_label("✨ گزارش مدیریتی هوشمند")
         st.write("با کلیک روی دکمه زیر، هوش مصنوعی داده‌های شما را بررسی کرده و یک گزارش مدیریتی تمیز و طبقه‌بندی شده ارائه می‌دهد.")
-        
+
         if st.button("تولید گزارش هوشمند وضعیت مالی", type="primary"):
             model = get_model()
             if not model:
@@ -533,17 +726,17 @@ elif st.session_state.active_tab == "داشبورد":
                     - مجموع درآمد: {total_income:,.0f}
                     - مجموع هزینه‌ها: {total_expense:,.0f}
                     - سود خالص: {total_profit:,.0f}
-                    
+
                     اگر دسته‌بندی‌هایی وجود دارد: (پرتکرارترین‌ها یا بیشترین مبالغ را مرور کن).
-                    
+
                     لطفاً یک گزارش فوق‌العاده تمیز، ساختاریافته و با لحن حرفه‌ای در زبان فارسی بنویس.
-                    حتماً از فرمت Markdown استفاده کن. 
+                    حتماً از فرمت Markdown استفاده کن.
                     بخش‌های الزامی گزارش:
                     ۱. **وضعیت کلی**: یک پاراگراف خلاصه از سلامت مالی.
                     ۲. **نقاط قوت**: بولت‌پوینت‌های کوتاه.
                     ۳. **نقاط ضعف یا هشدارها**: بولت‌پوینت‌های کوتاه.
                     ۴. **سه پیشنهاد عملیاتی**: برای افزایش سود.
-                    
+
                     از ایموجی‌های مناسب برای هر تیتر استفاده کن و متن را به گونه‌ای بنویس که در یک داشبورد بسیار شیک و خوانا به نظر برسد.
                     """
                     try:
@@ -597,3 +790,98 @@ elif st.session_state.active_tab == "دستیار هوش مصنوعی":
                         st.session_state.chat_history.append({"role": "assistant", "content": response.text})
                     except Exception as e:
                         st.error(f"خطا: {e}")
+
+# ---------- TAB: Telegram tasks ----------
+elif st.session_state.active_tab == "تسک‌های تلگرام":
+    section_label("🧑‍💼 مدیریت تسک از طریق تلگرام")
+
+    if not st.session_state.telegram_token:
+        st.warning("ابتدا توکن ربات تلگرام را در تب تنظیمات وارد و تست کنید.")
+    else:
+        section_label("۱. ثبت کارکنان جدید")
+        st.caption(
+            "هر کارمند باید اول در تلگرام به ربات شما پیام بدهد (مثلا /start)، سپس اینجا نمایش داده "
+            "می‌شود تا اسمش را ثبت کنید. طبق قوانین تلگرام، ربات نمی‌تواند بدون این مرحله شروع‌کننده مکالمه باشد."
+        )
+        if st.button("بررسی پیام‌های جدید از تلگرام"):
+            with st.spinner("در حال دریافت پیام‌ها..."):
+                updates = tg_get_updates()
+            registered = get_registered_chat_ids()
+            new_senders = {}
+            for u in updates:
+                msg = u.get("message")
+                if msg and "from" in msg:
+                    cid = str(msg["from"]["id"])
+                    if cid not in registered:
+                        new_senders[cid] = {
+                            "name": msg["from"].get("first_name", ""),
+                            "username": msg["from"].get("username", ""),
+                        }
+            st.session_state.new_telegram_senders.update(new_senders)
+            if not new_senders:
+                st.info("پیام جدیدی از کارمند ثبت‌نشده‌ای یافت نشد.")
+
+        for cid, info in list(st.session_state.new_telegram_senders.items()):
+            with st.container(border=True):
+                cols = st.columns([2, 2, 1])
+                name_input = cols[0].text_input(f"اسم کارمند (chat_id: {cid})", value=info["name"], key=f"name_{cid}")
+                cols[1].write(f"یوزرنیم: @{info['username']}" if info["username"] else "یوزرنیم ندارد")
+                if cols[2].button("ثبت", key=f"reg_{cid}"):
+                    add_employee(name_input, cid, info["username"])
+                    st.success(f"{name_input} ثبت شد.")
+                    del st.session_state.new_telegram_senders[cid]
+                    st.rerun()
+
+        employees_df = get_employees()
+        if not employees_df.empty:
+            st.caption("کارکنان ثبت‌شده:")
+            st.dataframe(employees_df[["name", "username"]], use_container_width=True, hide_index=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        section_label("۲. ایجاد تسک جدید")
+        if employees_df.empty:
+            st.info("ابتدا حداقل یک کارمند ثبت کنید.")
+        else:
+            with st.form("telegram_task_form", clear_on_submit=True):
+                title = st.text_input("عنوان تسک")
+                description = st.text_area("توضیحات", height=80)
+                assignee_name = st.selectbox("کارمند مسئول", employees_df["name"].tolist())
+                fc1, fc2 = st.columns(2)
+                due_date_val = fc1.date_input("مهلت انجام", value=None)
+                priority = fc2.selectbox("اولویت", ["پایین", "متوسط", "بالا"], index=1)
+                submitted = st.form_submit_button("ارسال تسک در تلگرام", type="primary")
+                if submitted:
+                    if not title.strip():
+                        st.error("عنوان تسک الزامی است.")
+                    else:
+                        employee_row = employees_df[employees_df["name"] == assignee_name].iloc[0]
+                        task_id, result = add_task_and_notify(
+                            title.strip(), description.strip(), employee_row, due_date_val, priority
+                        )
+                        if result and result.get("ok"):
+                            st.success(f"تسک برای {assignee_name} در تلگرام ارسال شد.")
+                        else:
+                            st.error(f"تسک ثبت شد ولی ارسال تلگرام ناموفق بود: {result}")
+                        st.rerun()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        section_label("۳. بررسی تاییدیه‌ها")
+        st.caption("چون این یک اپ Streamlit ساده است نه یک سرور همیشه‌روشن، تاییدیه‌ها فوری نیستند — هر بار این دکمه را بزنید یا صفحه را باز کنید بررسی می‌شود.")
+        if st.button("بررسی تاییدیه‌های جدید از تلگرام"):
+            with st.spinner("در حال بررسی..."):
+                confirmed = process_telegram_updates()
+            if confirmed:
+                st.success(f"{len(confirmed)} تسک به‌عنوان انجام‌شده ثبت شد.")
+            else:
+                st.info("تاییدیه جدیدی یافت نشد.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        section_label("لیست تسک‌ها")
+        tasks_df = get_tasks_with_employee()
+        if tasks_df.empty:
+            st.info("هنوز تسکی ثبت نشده است.")
+        else:
+            st.dataframe(
+                tasks_df[["title", "assignee", "due_date", "priority", "status"]],
+                use_container_width=True, hide_index=True
+            )
